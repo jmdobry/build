@@ -616,6 +616,7 @@ type GitHubIssueEvent struct {
 	Reviewer        *GitHubUser
 	TeamReviewer    *GitHubTeam
 	ReviewRequester *GitHubUser
+	Issue           *GitHubIssue
 	DismissedReview *GitHubDismissedReviewEvent
 }
 
@@ -1730,11 +1731,80 @@ func (p *githubRepoPoller) foreachItem(
 	}
 }
 
+func (p *githubRepoPoller) findIssuesToTombstone(ctx context.Context, lastUpdate time.Time) error {
+	const perPage = 100
+
+	err := p.foreachItem(ctx,
+		1,
+		func(ctx context.Context, page int) ([]interface{}, *github.Response, error) {
+			u := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/events?per_page=%v&page=%v",
+				p.Owner(), p.Repo(), perPage, page)
+			req, _ := http.NewRequest("GET", u, nil)
+
+			req.Header.Set("Authorization", "Bearer "+p.token)
+			req.Header.Set("User-Agent", "golang-x-build-maintner/1.0")
+			ctx, cancel := context.WithTimeout(ctx, time.Minute)
+			defer cancel()
+			req = req.WithContext(ctx)
+			res, err := p.client.Do(req)
+			if err != nil {
+				log.Printf("Fetching %s: %v", u, err)
+				return nil, nil, err
+			}
+			log.Printf("Fetching %s: %v", u, res.Status)
+			ghResp := makeGithubResponse(res)
+			if err := github.CheckResponse(res); err != nil {
+				log.Printf("Fetching %s: %v: %+v", u, res.Status, res.Header)
+				log.Printf("GitHub error %s: %v", u, ghResp)
+				return nil, nil, err
+			}
+
+			evts, err := parseGithubEvents(res.Body)
+			if err != nil {
+				return nil, nil, fmt.Errorf("%s: parse github events: %v", u, err)
+			}
+			is := make([]interface{}, len(evts))
+			for i, v := range evts {
+				is[i] = v
+			}
+
+			// Stop paginating if we've reached events from before the last issue sync.
+			ge := (is[len(is)-1]).(*GitHubIssueEvent)
+			if ge.Created.Before(lastUpdate) {
+				ghResp.NextPage = 0
+			}
+
+			return is, ghResp, err
+		},
+		func(v interface{}) error {
+			ge := v.(*GitHubIssueEvent)
+			if ge.Type != "delete" && ge.Type != "transferred" {
+				return nil
+			}
+			mut := &maintpb.Mutation{
+				GithubIssue: &maintpb.GithubIssueMutation{
+					Owner:    p.Owner(),
+					Repo:     p.Repo(),
+					Number:   ge.Issue.Number,
+					NotExist: true,
+				},
+			}
+			p.logf("tombstoning issue %d", ge.Issue.Number)
+			p.c.addMutation(mut)
+			return nil
+		})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (p *githubRepoPoller) syncIssues(ctx context.Context, expectChanges bool) error {
 	page := 1
 	seen := make(map[int64]bool)
 	keepGoing := true
 	owner, repo := p.gr.id.Owner, p.gr.id.Repo
+	var prevLastUpdate *time.Time = &p.lastUpdate
 	for keepGoing {
 		ghc := p.githubCaching
 		if expectChanges {
@@ -1817,6 +1887,9 @@ func (p *githubRepoPoller) syncIssues(ctx context.Context, expectChanges bool) e
 		}
 
 		if changes == 0 {
+			if prevLastUpdate != nil {
+				p.findIssuesToTombstone(ctx, *prevLastUpdate)
+			}
 			missing := p.gr.missingIssues()
 			if len(missing) == 0 {
 				p.logf("no changed issues; cached=%v", fromCache)
@@ -1845,6 +1918,7 @@ func (p *githubRepoPoller) syncIssues(ctx context.Context, expectChanges bool) e
 			p.logf("getting issue %v ...", num)
 			var issue *github.Issue
 			var err error
+			// TODO(jdobry): Skip issue if it's marked NotExist
 			for {
 				issue, _, err = p.githubDirect.Issues.Get(ctx, owner, repo, int(num))
 				if canRetry(ctx, err) {
@@ -1852,7 +1926,9 @@ func (p *githubRepoPoller) syncIssues(ctx context.Context, expectChanges bool) e
 				}
 				break
 			}
-			if ge, ok := err.(*github.ErrorResponse); ok && ge.Message == "Not Found" {
+			// A "Not Found" response indicates the issue has been deleted from GitHub and should be
+			// tombstoned.
+			if ge, ok := err.(*github.ErrorResponse); ok && ge.Response.StatusCode == http.StatusNotFound {
 				mp := &maintpb.Mutation{
 					GithubIssue: &maintpb.GithubIssueMutation{
 						Owner:    owner,
@@ -1861,10 +1937,26 @@ func (p *githubRepoPoller) syncIssues(ctx context.Context, expectChanges bool) e
 						NotExist: true,
 					},
 				}
+				p.logf("tombstoning issue %d: %s", issue.GetNumber(), issue.GetTitle())
 				p.c.addMutation(mp)
 				continue
 			} else if err != nil {
 				return err
+			}
+			// If issue.RepositoryURL doesn't match the request URL, this indicates the issue has been
+			// transferred to another repository and should be tombstoned.
+			if !strings.HasSuffix(*issue.RepositoryURL, "/"+owner+"/"+repo) {
+				mp := &maintpb.Mutation{
+					GithubIssue: &maintpb.GithubIssueMutation{
+						Owner:    owner,
+						Repo:     repo,
+						Number:   num,
+						NotExist: true,
+					},
+				}
+				p.logf("tombstoning issue %d: %s", issue.GetNumber(), issue.GetTitle())
+				p.c.addMutation(mp)
+				continue
 			}
 			mp := p.gr.newMutationFromIssue(nil, issue)
 			if mp == nil {
@@ -1934,6 +2026,21 @@ func (p *githubRepoPoller) syncCommentsOnIssue(ctx context.Context, issueNum int
 		if err != nil {
 			if canRetry(ctx, err) {
 				continue
+			}
+			// A "Not Found" response indicates the issue has been deleted from GitHub or transferred to
+			// another repository and should be tombstoned.
+			if ge, ok := err.(*github.ErrorResponse); ok && ge.Response.StatusCode == http.StatusNotFound {
+				mp := &maintpb.Mutation{
+					GithubIssue: &maintpb.GithubIssueMutation{
+						Owner:    owner,
+						Repo:     repo,
+						Number:   issueNum,
+						NotExist: true,
+					},
+				}
+				p.logf("tombstoning issue %d: %s", issueNum, issue.Title)
+				p.c.addMutation(mp)
+				return nil
 			}
 			return err
 		}
@@ -2082,6 +2189,12 @@ func (p *githubRepoPoller) syncEventsOnIssue(ctx context.Context, issueNum int32
 			if err != nil {
 				log.Printf("Fetching %s: %v", u, err)
 				return nil, nil, err
+			} else if res.StatusCode == http.StatusNotFound {
+				// A "Not Found" response indicates the issue has been deleted from GitHub or transferred
+				// to another repository and should be tombstoned.
+				mut.GetGithubIssue().NotExist = true
+				p.logf("tombstoning issue %d: %s", issueNum, gi.Title)
+				return nil, makeGithubResponse(res), nil
 			}
 			log.Printf("Fetching %s: %v", u, res.Status)
 			ghResp := makeGithubResponse(res)
@@ -2184,6 +2297,19 @@ func parseGithubEvents(r io.Reader) ([]*GitHubIssueEvent, error) {
 		getUser("assigner", &e.Assigner)
 		getUser("requested_reviewer", &e.Reviewer)
 		getUser("review_requester", &e.ReviewRequester)
+
+		if rt, ok := em["issue"]; ok {
+			delete(em, "issue")
+			im, ok := rt.(map[string]interface{})
+			if !ok {
+				log.Printf("got value %+v for 'issue' field, wanted a map with 'id' and 'number' fields", rt)
+			} else {
+				t := &GitHubIssue{}
+				t.ID = jint64(im["id"])
+				t.Number, _ = im["slug"].(int32)
+				e.Issue = t
+			}
+		}
 
 		if lm, ok := em["label"].(map[string]interface{}); ok {
 			delete(em, "label")
